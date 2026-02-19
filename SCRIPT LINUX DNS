@@ -7,62 +7,114 @@ DOMINIO="reprobados.com"
 ZONA_FILE="/etc/bind/db.$DOMINIO"
 CONF_LOCAL="/etc/bind/named.conf.local"
 
-# Colores para la interfaz
-GREEN='\e[32m'
-RED='\e[31m'
-YELLOW='\e[33m'
-BLUE='\e[34m'
-NC='\e[0m' # No Color
+# --- COLORES Y ESTILOS ---
+# Usamos tput para mayor compatibilidad
+BOLD=$(tput bold)
+RESET=$(tput sgr0)
+RED=$(tput setaf 1)
+GREEN=$(tput setaf 2)
+YELLOW=$(tput setaf 3)
+BLUE=$(tput setaf 4)
+MAGENTA=$(tput setaf 5)
+CYAN=$(tput setaf 6)
+WHITE=$(tput setaf 7)
+
+# --- FUNCIONES AUXILIARES DE DISEÑO ---
+header() {
+    clear
+    echo "${CYAN}╔══════════════════════════════════════════════════════╗${RESET}"
+    echo "${CYAN}║           GESTOR DE SERVIDOR DNS (BIND9)             ║${RESET}"
+    echo "${CYAN}╠══════════════════════════════════════════════════════╣${RESET}"
+    echo "${CYAN}║${RESET} ${YELLOW}Dominio Configurado:${RESET} ${WHITE}$DOMINIO${RESET}"
+    echo "${CYAN}║${RESET} ${YELLOW}Interfaz de Red:${RESET}     ${WHITE}$INTERFAZ${RESET}"
+    echo "${CYAN}╚══════════════════════════════════════════════════════╝${RESET}"
+    echo ""
+}
+
+msg_info() {
+    echo -e "${BLUE} ➤ ${RESET} $1"
+}
+
+msg_ok() {
+    echo -e "${GREEN} ✔ ${RESET} $1"
+}
+
+msg_warn() {
+    echo -e "${YELLOW} ⚠ ${RESET} $1"
+}
+
+msg_error() {
+    echo -e "${RED} ✘ ${RESET} $1"
+}
+
+pause() {
+    echo ""
+    read -p "${MAGENTA} [ Presiona Enter para continuar ]${RESET}"
+}
 
 registrar_log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | sudo tee -a "$LOG_DNS" > /dev/null
 }
 
-# --- 1. VERIFICACIÓN DE IP FIJA (Requerimiento) ---
+# --- 1. VERIFICACIÓN DE IP FIJA ---
 verificar_ip_fija() {
-    echo -e "${BLUE}Verificando configuración de red...${NC}"
+    msg_info "Verificando configuración de red..."
+    
     # Intentamos obtener la IP actual de la interfaz
     IP_ACTUAL=$(ip -4 addr show $INTERFAZ | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
 
     if [ -z "$IP_ACTUAL" ]; then
-        echo -e "${YELLOW}No se detectó IP en $INTERFAZ. Configure una IP fija:${NC}"
-        read -p "Ingrese la IP para este servidor: " IP_ACTUAL
+        msg_warn "No se detectó IP en $INTERFAZ."
+        echo -ne "${YELLOW} Ingrese la IP manual para este servidor:${RESET} "
+        read IP_ACTUAL
         sudo ip addr add $IP_ACTUAL/24 dev $INTERFAZ
         sudo ip link set $INTERFAZ up
         registrar_log "IP asignada manualmente: $IP_ACTUAL"
+        msg_ok "IP asignada temporalmente: $IP_ACTUAL"
     else
-        echo -e "${GREEN}✓ IP detectada: $IP_ACTUAL${NC}"
+        msg_ok "IP detectada correctamente: ${BOLD}$IP_ACTUAL${RESET}"
     fi
 }
 
 # --- 2. INSTALACIÓN IDEMPOTENTE ---
 instalar_bind() {
+    msg_info "Verificando paquetes necesarios..."
+    
     if dpkg -l | grep -q bind9; then
-        echo -e "${GREEN}✓ BIND9 ya está instalado.${NC}"
+        msg_ok "BIND9 ya está instalado."
     else
-        echo -e "${YELLOW}Instalando BIND9 y utilerías...${NC}"
+        msg_warn "Instalando BIND9 y utilerías (esto puede tardar)..."
         sudo apt-get update -y -qq > /dev/null
         sudo apt-get install bind9 bind9utils bind9-doc -y -qq > /dev/null
-        registrar_log "BIND9 instalado correctamente"
+        
+        if [ $? -eq 0 ]; then
+            registrar_log "BIND9 instalado correctamente"
+            msg_ok "Instalación completada."
+        else
+            msg_error "Falló la instalación. Revise su conexión a internet."
+        fi
     fi
 }
 
 # --- 3. CONFIGURACIÓN DE ZONAS ---
 configurar_zonas() {
-    echo -e "${BLUE}Configurando zona: $DOMINIO...${NC}"
+    msg_info "Configurando zona maestra: ${BOLD}$DOMINIO${RESET}"
     
     # Configurar named.conf.local (Solo si no existe la entrada)
     if ! grep -q "zone \"$DOMINIO\"" "$CONF_LOCAL"; then
         sudo bash -c "cat >> $CONF_LOCAL" <<EOF
+
 zone "$DOMINIO" {
     type master;
     file "$ZONA_FILE";
 };
 EOF
+        msg_ok "Zona añadida a named.conf.local"
+    else
+        msg_info "La zona ya estaba definida en named.conf.local"
     fi
 
     # Crear archivo de zona (db.reprobados.com)
-    # Se usa la IP detectada para los registros A
     sudo bash -c "cat > $ZONA_FILE" <<EOF
 ;
 ; BIND data file for $DOMINIO
@@ -76,70 +128,102 @@ EOF
                          604800 )       ; Negative Cache TTL
 ;
 @       IN      NS      ns1.$DOMINIO.
-ns1     IN      A       $IP_ACTUAL
 @       IN      A       $IP_ACTUAL
+ns1     IN      A       $IP_ACTUAL
 www     IN      A       $IP_ACTUAL
 EOF
     
     registrar_log "Zona $DOMINIO configurada apuntando a $IP_ACTUAL"
     sudo systemctl restart bind9
+    msg_ok "Archivo de zona creado y servicio reiniciado."
 }
 
 # --- 4. VALIDACIÓN Y PRUEBAS ---
 validar_configuracion() {
-    echo -e "${BLUE}Ejecutando pruebas de validación...${NC}"
+    echo ""
+    echo "${CYAN}--- EJECUTANDO PRUEBAS DE VALIDACIÓN ---${RESET}"
     
     # Prueba de sintaxis
     if named-checkconf > /dev/null; then
-        echo -e "${GREEN}✓ Sintaxis de BIND correcta.${NC}"
+        msg_ok "Sintaxis de configuración BIND: CORRECTA"
     else
-        echo -e "${RED}✗ Error en la sintaxis de configuración.${NC}"
+        msg_error "Error de sintaxis en BIND. Revise los logs."
     fi
 
     # Prueba de resolución local
-    echo -e "${YELLOW}Probando resolución local de $DOMINIO...${NC}"
+    msg_info "Probando resolución DNS local..."
     sleep 2
-    if nslookup $DOMINIO 127.0.0.1 | grep -q "$IP_ACTUAL"; then
-        echo -e "${GREEN}✓ Resolución exitosa: $DOMINIO -> $IP_ACTUAL${NC}"
+    
+    RESULTADO=$(nslookup $DOMINIO 127.0.0.1 2>/dev/null | grep "Address:" | tail -n1 | awk '{print $2}')
+    
+    if [ "$RESULTADO" == "$IP_ACTUAL" ]; then
+        msg_ok "Resolución exitosa: $DOMINIO -> $RESULTADO"
     else
-        echo -e "${RED}✗ La resolución falló o la IP no coincide.${NC}"
+        msg_error "Fallo en resolución. Se obtuvo: '$RESULTADO' (Esperado: $IP_ACTUAL)"
+        msg_warn "Asegúrese de que el puerto 53 no esté bloqueado."
     fi
+}
+
+# --- 5. MOSTRAR ESTADO DE ZONA ---
+mostrar_estado_zona() {
+    header
+    echo "${MAGENTA}>>> CONTENIDO DEL ARCHIVO DE ZONA ($ZONA_FILE)${RESET}"
+    echo ""
+    if [ -f "$ZONA_FILE" ]; then
+        cat "$ZONA_FILE" | grep -v ";" | grep -v "^$" # Muestra limpio sin comentarios
+    else
+        msg_error "El archivo de zona no existe aún."
+    fi
+    echo ""
 }
 
 # --- MENÚ PRINCIPAL ---
 while true; do
-    echo -e "\n${BLUE}========================================${NC}"
-    echo -e "${BLUE}     GESTOR DNS (BIND9) - $DOMINIO${NC}"
-    echo -e "${BLUE}========================================${NC}"
-    echo "1) Verificar Instalación"
-    echo "2) Instalar y Configurar DNS (Auto)"
-    echo "3) Reconfigurar (Actualizar IP)"
-    echo "4) ABC Dominios (Status de Zona)"
-    echo "5) Salir"
-    read -p "Seleccione opción: " opt
+    header
+    echo "${GREEN}  1.${RESET} Verificar Instalación y Red"
+    echo "${GREEN}  2.${RESET} Instalar y Configurar DNS (Automático)"
+    echo "${GREEN}  3.${RESET} Reconfigurar IP del Servidor"
+    echo "${GREEN}  4.${RESET} Ver Estado de la Zona (Registros)"
+    echo "${GREEN}  5.${RESET} Salir"
+    echo ""
+    echo -n "${CYAN}  Seleccione una opción [1-5]: ${RESET}"
+    read opt
 
     case $opt in
         1)
+            header
             instalar_bind
             verificar_ip_fija
+            pause
             ;;
         2)
+            header
             verificar_ip_fija
             instalar_bind
             configurar_zonas
             validar_configuracion
+            pause
             ;;
         3)
-            read -p "Nueva IP para los registros: " IP_ACTUAL
+            header
+            echo -ne "${YELLOW} Ingrese nueva IP para los registros: ${RESET}"
+            read IP_ACTUAL
             configurar_zonas
             validar_configuracion
+            pause
             ;;
         4)
-            echo -e "${YELLOW}Estado actual de la zona:${NC}"
-            [ -f "$ZONA_FILE" ] && cat "$ZONA_FILE" || echo "Zona no configurada"
+            mostrar_estado_zona
+            pause
             ;;
-        5) exit 0 ;;
-        *) echo -e "${RED}Opción no válida${NC}" ;;
+        5)
+            echo ""
+            msg_info "Saliendo del sistema..."
+            exit 0
+            ;;
+        *)
+            msg_error "Opción no válida."
+            sleep 1
+            ;;
     esac
-    read -p "Presione Enter para continuar..."
 done
