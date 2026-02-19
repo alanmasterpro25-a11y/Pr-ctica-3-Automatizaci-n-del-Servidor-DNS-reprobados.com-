@@ -1,0 +1,145 @@
+#!/bin/bash
+
+# --- CONFIGURACIÓN Y VARIABLES ---
+LOG_DNS="/var/log/dns_gestion.log"
+INTERFAZ="ens34" # Misma interfaz que tu DHCP
+DOMINIO="reprobados.com"
+ZONA_FILE="/etc/bind/db.$DOMINIO"
+CONF_LOCAL="/etc/bind/named.conf.local"
+
+# Colores para la interfaz
+GREEN='\e[32m'
+RED='\e[31m'
+YELLOW='\e[33m'
+BLUE='\e[34m'
+NC='\e[0m' # No Color
+
+registrar_log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | sudo tee -a "$LOG_DNS" > /dev/null
+}
+
+# --- 1. VERIFICACIÓN DE IP FIJA (Requerimiento) ---
+verificar_ip_fija() {
+    echo -e "${BLUE}Verificando configuración de red...${NC}"
+    # Intentamos obtener la IP actual de la interfaz
+    IP_ACTUAL=$(ip -4 addr show $INTERFAZ | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+
+    if [ -z "$IP_ACTUAL" ]; then
+        echo -e "${YELLOW}No se detectó IP en $INTERFAZ. Configure una IP fija:${NC}"
+        read -p "Ingrese la IP para este servidor: " IP_ACTUAL
+        sudo ip addr add $IP_ACTUAL/24 dev $INTERFAZ
+        sudo ip link set $INTERFAZ up
+        registrar_log "IP asignada manualmente: $IP_ACTUAL"
+    else
+        echo -e "${GREEN}✓ IP detectada: $IP_ACTUAL${NC}"
+    fi
+}
+
+# --- 2. INSTALACIÓN IDEMPOTENTE ---
+instalar_bind() {
+    if dpkg -l | grep -q bind9; then
+        echo -e "${GREEN}✓ BIND9 ya está instalado.${NC}"
+    else
+        echo -e "${YELLOW}Instalando BIND9 y utilerías...${NC}"
+        sudo apt-get update -y -qq > /dev/null
+        sudo apt-get install bind9 bind9utils bind9-doc -y -qq > /dev/null
+        registrar_log "BIND9 instalado correctamente"
+    fi
+}
+
+# --- 3. CONFIGURACIÓN DE ZONAS ---
+configurar_zonas() {
+    echo -e "${BLUE}Configurando zona: $DOMINIO...${NC}"
+    
+    # Configurar named.conf.local (Solo si no existe la entrada)
+    if ! grep -q "zone \"$DOMINIO\"" "$CONF_LOCAL"; then
+        sudo bash -c "cat >> $CONF_LOCAL" <<EOF
+zone "$DOMINIO" {
+    type master;
+    file "$ZONA_FILE";
+};
+EOF
+    fi
+
+    # Crear archivo de zona (db.reprobados.com)
+    # Se usa la IP detectada para los registros A
+    sudo bash -c "cat > $ZONA_FILE" <<EOF
+;
+; BIND data file for $DOMINIO
+;
+\$TTL    604800
+@       IN      SOA     ns1.$DOMINIO. root.$DOMINIO. (
+                              2         ; Serial
+                         604800         ; Refresh
+                          86400         ; Retry
+                        2419200         ; Expire
+                         604800 )       ; Negative Cache TTL
+;
+@       IN      NS      ns1.$DOMINIO.
+ns1     IN      A       $IP_ACTUAL
+@       IN      A       $IP_ACTUAL
+www     IN      A       $IP_ACTUAL
+EOF
+    
+    registrar_log "Zona $DOMINIO configurada apuntando a $IP_ACTUAL"
+    sudo systemctl restart bind9
+}
+
+# --- 4. VALIDACIÓN Y PRUEBAS ---
+validar_configuracion() {
+    echo -e "${BLUE}Ejecutando pruebas de validación...${NC}"
+    
+    # Prueba de sintaxis
+    if named-checkconf > /dev/null; then
+        echo -e "${GREEN}✓ Sintaxis de BIND correcta.${NC}"
+    else
+        echo -e "${RED}✗ Error en la sintaxis de configuración.${NC}"
+    fi
+
+    # Prueba de resolución local
+    echo -e "${YELLOW}Probando resolución local de $DOMINIO...${NC}"
+    sleep 2
+    if nslookup $DOMINIO 127.0.0.1 | grep -q "$IP_ACTUAL"; then
+        echo -e "${GREEN}✓ Resolución exitosa: $DOMINIO -> $IP_ACTUAL${NC}"
+    else
+        echo -e "${RED}✗ La resolución falló o la IP no coincide.${NC}"
+    fi
+}
+
+# --- MENÚ PRINCIPAL ---
+while true; do
+    echo -e "\n${BLUE}========================================${NC}"
+    echo -e "${BLUE}     GESTOR DNS (BIND9) - $DOMINIO${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo "1) Verificar Instalación"
+    echo "2) Instalar y Configurar DNS (Auto)"
+    echo "3) Reconfigurar (Actualizar IP)"
+    echo "4) ABC Dominios (Status de Zona)"
+    echo "5) Salir"
+    read -p "Seleccione opción: " opt
+
+    case $opt in
+        1)
+            instalar_bind
+            verificar_ip_fija
+            ;;
+        2)
+            verificar_ip_fija
+            instalar_bind
+            configurar_zonas
+            validar_configuracion
+            ;;
+        3)
+            read -p "Nueva IP para los registros: " IP_ACTUAL
+            configurar_zonas
+            validar_configuracion
+            ;;
+        4)
+            echo -e "${YELLOW}Estado actual de la zona:${NC}"
+            [ -f "$ZONA_FILE" ] && cat "$ZONA_FILE" || echo "Zona no configurada"
+            ;;
+        5) exit 0 ;;
+        *) echo -e "${RED}Opción no válida${NC}" ;;
+    esac
+    read -p "Presione Enter para continuar..."
+done
