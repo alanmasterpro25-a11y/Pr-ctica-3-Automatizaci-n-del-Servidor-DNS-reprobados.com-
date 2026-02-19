@@ -1,6 +1,8 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# --- FUNCIONES DE UTILIDAD ---
+
 function Afirmar-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $p  = New-Object Security.Principal.WindowsPrincipal($id)
@@ -51,6 +53,8 @@ function Leer-IPv4Opcional([string]$Prompt) {
     }
 }
 
+# --- FUNCIONES DE CALCULO IP ---
+
 function Convertir-AUInt32IPv4([string]$Ip) {
     $b = ([System.Net.IPAddress]::Parse($Ip)).GetAddressBytes()
     [Array]::Reverse($b)
@@ -91,11 +95,9 @@ function Obtener-MascaraDeSubredDesdePrefijo([int]$Prefix) {
 
 function Obtener-PrefijoDesdeMascara([string]$Mask) {
     if (-not (Probar-IPv4 $Mask)) { throw "Mascara invalida: $Mask" }
-
     $bytes = ([System.Net.IPAddress]::Parse($Mask)).GetAddressBytes()
     $prefix = 0
     $vistoNo255 = $false
-
     foreach ($b in $bytes) {
         switch ($b) {
             255 { if ($vistoNo255) { throw "Mascara no contigua: $Mask" }; $prefix += 8 }
@@ -123,15 +125,18 @@ function Afirmar-MismaSubredYOrden([string]$StartIp, [string]$EndIp, [string]$Ma
     $n1 = Obtener-DireccionDeRed $StartIp $Mask
     $n2 = Obtener-DireccionDeRed $EndIp   $Mask
     if ($n1 -ne $n2) { throw "IP inicial y final NO estan en la misma subred (mascara $Mask)." }
-
     $s = Convertir-AUInt32IPv4 $StartIp
     $e = Convertir-AUInt32IPv4 $EndIp
     if ($e -le $s) { throw "La IP final debe ser mayor que la IP inicial." }
 }
 
+# --- FUNCIONES DE RED ---
+
 function Seleccionar-AliasInterfaz {
-    $adapters = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Sort-Object -Property Name
-    if (-not $adapters) { throw "No hay adaptadores." }
+    # FIX: Forzar @() para que sea siempre un array y tenga propiedad .Count
+    $adapters = @(Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Sort-Object -Property Name)
+    
+    if ($adapters.Count -eq 0) { throw "No hay adaptadores." }
 
     Write-Host ""
     Write-Host "Interfaces disponibles:"
@@ -154,8 +159,8 @@ function Establecer-IPv4EstaticaEnInterfaz([string]$InterfaceAlias, [string]$Ip,
     $prefix = Obtener-PrefijoDesdeMascara $Mask
 
     Write-Host ""
-    Write-Host "AVISO: Se asignara IP estatica $Ip/$prefix en '$InterfaceAlias'. Esto puede cortar conectividad si estas conectado por esa interfaz."
-
+    Write-Host "AVISO: Se asignara IP estatica $Ip/$prefix en '$InterfaceAlias'."
+    
     Set-NetIPInterface -InterfaceAlias $InterfaceAlias -AddressFamily IPv4 -Dhcp Disabled | Out-Null
 
     $existing = Get-NetIPAddress -InterfaceAlias $InterfaceAlias -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -191,23 +196,20 @@ function Instalar-RolDhcp([bool]$Reinstalar) {
         Write-Host "Reinstalando DHCP Server..."
         Uninstall-WindowsFeature -Name DHCP -Remove -Restart:$false | Out-Null
     }
-
     Write-Host "Instalando DHCP Server..."
     Install-WindowsFeature -Name DHCP -IncludeManagementTools -Restart:$false | Out-Null
-
+    
     Get-NetFirewallRule -ErrorAction SilentlyContinue |
         Where-Object { $_.DisplayGroup -like "*DHCP*" } |
         Set-NetFirewallRule -Enabled True -ErrorAction SilentlyContinue | Out-Null
 
     Start-Service -Name DHCPServer -ErrorAction SilentlyContinue
     Set-Service   -Name DHCPServer -StartupType Automatic -ErrorAction SilentlyContinue
-
     Write-Host "Instalacion completada."
 }
 
 function Configurar-Ambito {
     if (-not (Es-RolDhcpInstalado)) { throw "DHCP Server NO esta instalado." }
-
     Import-Module DhcpServer -ErrorAction Stop
 
     Write-Host ""
@@ -217,15 +219,14 @@ function Configurar-Ambito {
     if ([string]::IsNullOrWhiteSpace($scopeName)) { $scopeName = "Scope-1" }
 
     $serverIp = Leer-IPv4 "Rango inicial "
-
     $prefix = Obtener-PrefijoPorDefectoDeIp $serverIp
     $mask   = Obtener-MascaraDeSubredDesdePrefijo $prefix
-    Write-Host "Mascara calculada desde la IP inicial: $mask (/$prefix)"
+    Write-Host "Mascara calculada: $mask (/$prefix)"
 
     $endIp = Leer-IPv4 "Rango final"
     Afirmar-MismaSubredYOrden $serverIp $endIp $mask
-
     $poolStart = Incrementar-IPv4 $serverIp
+
     if ((Convertir-AUInt32IPv4 $poolStart) -gt (Convertir-AUInt32IPv4 $endIp)) {
         throw "El pool quedaria vacio."
     }
@@ -233,29 +234,25 @@ function Configurar-Ambito {
     $gateway = Leer-IPv4Opcional "Gateway"
     if ($gateway) {
         if ((Obtener-DireccionDeRed $gateway $mask) -ne (Obtener-DireccionDeRed $serverIp $mask)) {
-            throw "El Gateway no esta en la misma subred que el ambito."
+            throw "El Gateway no esta en la misma subred."
         }
     }
 
     $dns1 = Leer-IPv4Opcional "DNS primario"
     $dns2 = $null
-    if ($dns1) {
-        $dns2 = Leer-IPv4Opcional "DNS secundario"
-    }
+    if ($dns1) { $dns2 = Leer-IPv4Opcional "DNS secundario" }
 
     $dnsList = @()
     if ($dns1) { $dnsList += $dns1 }
     if ($dns2) { $dnsList += $dns2 }
 
     while ($true) {
-        $raw = (Read-Host "Tiempo de concesion en segundos").Trim()
+        $raw = (Read-Host "Tiempo concesion (segundos)").Trim()
         if ($raw -match '^\d+$') {
-            $leaseSeconds = [int]$raw
-            if ($leaseSeconds -gt 0 -and $leaseSeconds -le 31536000) { break }
+            $ls = [int]$raw
+            if ($ls -gt 0) { $leaseDuration = New-TimeSpan -Seconds $ls; break }
         }
-        Write-Host "Valor invalido. Ingresa un entero > 0 (max 31536000)."
     }
-    $leaseDuration = New-TimeSpan -Seconds $leaseSeconds
 
     $iface = Seleccionar-AliasInterfaz
     Establecer-IPv4EstaticaEnInterfaz -InterfaceAlias $iface -Ip $serverIp -Mask $mask -DnsServersOptional $dnsList
@@ -263,82 +260,85 @@ function Configurar-Ambito {
     $scopeIdStr = Obtener-DireccionDeRed $serverIp $mask
     $scopeId = [System.Net.IPAddress]::Parse($scopeIdStr)
 
-    $existingScope = Get-DhcpServerv4Scope -ErrorAction SilentlyContinue |
-        Where-Object { $_.ScopeId -eq $scopeId }
+    $existingScope = Get-DhcpServerv4Scope -ErrorAction SilentlyContinue | Where-Object { $_.ScopeId -eq $scopeId }
     if ($existingScope) {
-        $overwrite = Leer-SiNo "Ya existe un ambito con ScopeId $scopeIdStr. Quieres reemplazarlo?" $false
-        if (-not $overwrite) { Write-Host "Cancelado."; return }
+        $overwrite = Leer-SiNo "Ya existe el ambito $scopeIdStr. Reemplazar?" $false
+        if (-not $overwrite) { return }
         Remove-DhcpServerv4Scope -ScopeId $scopeId -Force -ErrorAction SilentlyContinue
     }
 
     Add-DhcpServerv4Scope -Name $scopeName -StartRange $poolStart -EndRange $endIp -SubnetMask $mask | Out-Null
     Set-DhcpServerv4Scope -ScopeId $scopeId -State Active -LeaseDuration $leaseDuration | Out-Null
 
-    if ($gateway) {
-        Set-DhcpServerv4OptionValue -ScopeId $scopeId -Router $gateway | Out-Null
-    }
-    if ($dnsList -and $dnsList.Count -gt 0) {
-        Set-DhcpServerv4OptionValue -ScopeId $scopeId -DnsServer $dnsList | Out-Null
-    }
-
+    if ($gateway) { Set-DhcpServerv4OptionValue -ScopeId $scopeId -Router $gateway | Out-Null }
+    
+    # --- CORRECCION AQUI: Se agrega -Force para evitar validacion de DNS ---
+    if ($dnsList) { Set-DhcpServerv4OptionValue -ScopeId $scopeId -DnsServer $dnsList -Force | Out-Null }
+    
     Restart-Service -Name DHCPServer -Force
 }
 
-function Mostrar-Monitoreo {
+# --- FUNCION PARA BORRAR ---
+function Eliminar-Un-Ambito {
+    if (-not (Es-RolDhcpInstalado)) { Write-Host "DHCP no instalado."; return }
+    Import-Module DhcpServer -ErrorAction Stop
+
+    # FIX: Forzar @() para que sea Array
+    $scopes = @(Get-DhcpServerv4Scope -ErrorAction SilentlyContinue)
     
+    if ($scopes.Count -eq 0) { Write-Host "No hay ambitos para borrar."; return }
+
+    Write-Host ""
+    Write-Host "--- Elige el ambito a BORRAR ---"
+    for ($i=0; $i -lt $scopes.Count; $i++) {
+        $s = $scopes[$i]
+        Write-Host ("[{0}] IP: {1} | Nombre: {2} | Estado: {3}" -f ($i+1), $s.ScopeId, $s.Name, $s.State)
+    }
+    Write-Host "[0] Cancelar"
+
+    while ($true) {
+        $sel = (Read-Host "Numero").Trim()
+        if ($sel -eq "0") { return }
+        if ($sel -match '^\d+$') {
+            $idx = [int]$sel - 1
+            if ($idx -ge 0 -and $idx -lt $scopes.Count) {
+                $target = $scopes[$idx]
+                $confirm = Leer-SiNo "Seguro que quieres borrar el ambito $($target.ScopeId)?" $false
+                if ($confirm) {
+                    Remove-DhcpServerv4Scope -ScopeId $target.ScopeId -Force
+                    Write-Host "Ambito eliminado."
+                    Restart-Service DHCPServer -Force
+                }
+                return
+            }
+        }
+        Write-Host "Seleccion invalida."
+    }
+}
+
+function Mostrar-Monitoreo {
     Write-Host ""
     Write-Host "--- Monitoreo DHCP ---"
-
-    $installed = $false
-    try { $installed = Es-RolDhcpInstalado } catch { $installed = $false }
-
-    if (-not $installed) {
-        Write-Host "DHCP no esta instalado."
-        return
-    }
-
+    if (-not (Es-RolDhcpInstalado)) { Write-Host "DHCP no instalado."; return }
     Import-Module DhcpServer -ErrorAction Stop
 
     $scopes = Get-DhcpServerv4Scope -ErrorAction SilentlyContinue
-    if (-not $scopes) {
-        Write-Host "No hay configuracion todavia."
-        return
-    }
+    if (-not $scopes) { Write-Host "No hay ambitos."; return }
 
-    $svc = Get-Service -Name DHCPServer -ErrorAction SilentlyContinue
-    if ($svc) {
-        $startMode = ""
-        try { $startMode = (Get-CimInstance Win32_Service -Filter "Name='DHCPServer'").StartMode } catch { $startMode = "N/A" }
-        Write-Host ("Servicio DHCPServer: {0} / StartupType: {1}" -f $svc.Status, $startMode)
-    } else {
-        Write-Host "Servicio DHCP: no encontrado."
-    }
-
-    Write-Host ""
-    Write-Host "--- Ambitos ---"
-    $scopes | Select-Object Name, ScopeId, StartRange, EndRange, SubnetMask, State, LeaseDuration | Format-Table -AutoSize
+    $scopes | Select-Object Name, ScopeId, StartRange, EndRange, State | Format-Table -AutoSize
 
     foreach ($s in $scopes) {
-        Write-Host ""
-        Write-Host ("--- Leases del Scope {0} ({1}) ---" -f $s.Name, $s.ScopeId)
+        Write-Host "--- Leases del Scope $($s.Name) ($($s.ScopeId)) ---"
         $leases = Get-DhcpServerv4Lease -ScopeId $s.ScopeId -ErrorAction SilentlyContinue
         if ($leases) {
-            $leases | Sort-Object -Property IPAddress |
-                Select-Object IPAddress, ClientId, HostName, AddressState, LeaseExpiryTime |
-                Format-Table -AutoSize
+            $leases | Select-Object IPAddress, ClientId, HostName, AddressState | Format-Table -AutoSize
         } else {
-            Write-Host "Aun no hay leases."
+            Write-Host "Sin leases."
         }
     }
 }
 
-
 function Reiniciar-ServicioDhcp {
-    $svc = Get-Service -Name DHCPServer -ErrorAction SilentlyContinue
-    if (-not $svc) {
-        Write-Host "Servicio DHCP no encontrado."
-        return
-    }
     Restart-Service -Name DHCPServer -Force
     Write-Host "Servicio reiniciado."
 }
@@ -346,14 +346,15 @@ function Reiniciar-ServicioDhcp {
 function Mostrar-Menu {
     Clear-Host
     Write-Host "-------------------------------"
-    Write-Host "   MENU DHCP (Windows Server)  "
+    Write-Host "   MENU DHCP (DNS Force Fix)   "
     Write-Host "-------------------------------"
-    Write-Host "1) Verificar si DHCP esta instalado"
-    Write-Host "2) Instalar DHCP "
-    Write-Host "3) Configurar ambito "
+    Write-Host "1) Verificar instalacion"
+    Write-Host "2) Instalar DHCP"
+    Write-Host "3) Configurar ambito"
     Write-Host "4) Monitoreo"
     Write-Host "5) Reiniciar servicio DHCP"
-    Write-Host "6) Salir"
+    Write-Host "6) ELIMINAR un ambito"
+    Write-Host "7) Salir"
     Write-Host ""
 }
 
@@ -361,54 +362,26 @@ try {
     Afirmar-Admin
     while ($true) {
         Mostrar-Menu
-        $opt = (Read-Host "Elige una opcion (1-6)").Trim()
-
+        $opt = (Read-Host "Elige una opcion (1-7)").Trim()
         try {
             switch ($opt) {
-                "1" {
-                    Write-Host ""
-                    $installed = $false
-                    try { $installed = Es-RolDhcpInstalado } catch { $installed = $false }
-                    $t = if ($installed) { "SI" } else { "NO" }
-                    Write-Host ("DHCP instalado: {0}" -f $t)
-                    Pausa-Enter
+                "1" { 
+                    $inst = try { Es-RolDhcpInstalado } catch { $false }
+                    Write-Host "Instalado: $(if($inst){'SI'}else{'NO'})"; Pausa-Enter 
                 }
-                "2" {
-                    $installed = $false
-                    try { $installed = Es-RolDhcpInstalado } catch { $installed = $false }
-
-                    if ($installed) {
-                        $re = Leer-SiNo "DHCP ya esta instalado. Quieres REINSTALAR?" $false
-                        Instalar-RolDhcp -Reinstalar:$re
-                    } else {
-                        Instalar-RolDhcp -Reinstalar:$false
-                    }
-                    Pausa-Enter
-                }
-                "3" {
-                    Configurar-Ambito
-                    Pausa-Enter
-                }
-                "4" {
-                    Mostrar-Monitoreo
-                    Pausa-Enter
-                }
-                "5" {
-                    Reiniciar-ServicioDhcp
-                    Pausa-Enter
-                }
-                "6" { break }
-                default {
-                    Write-Host "Opcion invalida."
-                    Start-Sleep -Seconds 1
-                }
+                "2" { Instalar-RolDhcp -Reinstalar:$false; Pausa-Enter }
+                "3" { Configurar-Ambito; Pausa-Enter }
+                "4" { Mostrar-Monitoreo; Pausa-Enter }
+                "5" { Reiniciar-ServicioDhcp; Pausa-Enter }
+                "6" { Eliminar-Un-Ambito; Pausa-Enter }
+                "7" { break }
             }
+            if ($opt -eq "7") { break }
         } catch {
-            Write-Host ""
-            Write-Host ("ERROR: {0}" -f $_.Exception.Message)
+            Write-Host "ERROR: $_"
             Pausa-Enter
         }
     }
 } catch {
-    Write-Host ("ERROR: {0}" -f $_.Exception.Message)
+    Write-Host "ERROR FATAL: $_"
 }
